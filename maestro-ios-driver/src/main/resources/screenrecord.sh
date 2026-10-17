@@ -1,0 +1,59 @@
+# The `simctl recordVideo` command requires a SIGINT to be sent to stop the recording.
+# Before the SIGINT is sent, the video file is not playable.
+# Kotlin / JVM has no API to sent signals to subprocesses.
+# To work around that one could try to use `kill -SIGINT $pid`.
+# Kotlin / JVM on language level < 9 has no API to get the PID of a subprocess.
+# There just isn't a good way to make Kotlin record a video using xctest simctl.
+# That's where this script comes in. It send the SIGINT to simctl as soon as its
+# STDIN pipe is closed.
+
+# Also not that the backend currently does not support hvec. That is why the
+# codec is set to h264.
+
+# Clean path, so the poll below only sees the file simctl creates.
+rm -f "$RECORDING_PATH"
+
+xcrun simctl io "$DEVICE_ID" recordVideo --force --codec h264 "$RECORDING_PATH" >"${RECORDING_PATH}.out" 2>"${RECORDING_PATH}.err" &
+simctlpid=$!
+
+# Wait (about 10s: 500 checks, 20ms apart) for simctl to either fail fast or create the
+# output file. The RECORDING_STARTED line below is what the host stamps the recording's
+# start from, so it must follow the file appearing as closely as possible.
+for _ in $(seq 1 500); do
+    if ! kill -0 "$simctlpid" 2>/dev/null; then
+        break
+    fi
+    if [ -e "$RECORDING_PATH" ]; then
+        break
+    fi
+    sleep 0.02
+done
+
+if ! kill -0 "$simctlpid" 2>/dev/null; then
+    wait $simctlpid
+    exit_code=$?
+    out_msg=$(cat "${RECORDING_PATH}.out" 2>/dev/null)
+    err_msg=$(cat "${RECORDING_PATH}.err" 2>/dev/null)
+    rm -f "${RECORDING_PATH}.out" "${RECORDING_PATH}.err"
+    echo "RECORDING_FAILED exit_code=$exit_code stdout=[$out_msg] stderr=[$err_msg]"
+    exit 1
+fi
+
+# A recorder that never opened its file was never observed to start: report that rather
+# than stamp a start time that would not be true.
+if [ ! -e "$RECORDING_PATH" ]; then
+    kill -SIGINT "$simctlpid" 2>/dev/null
+    wait $simctlpid
+    rm -f "${RECORDING_PATH}.out" "${RECORDING_PATH}.err"
+    echo "RECORDING_FAILED exit_code=timeout stdout=[] stderr=[recorder did not create $RECORDING_PATH within 10s]"
+    exit 1
+fi
+
+rm -f "${RECORDING_PATH}.out" "${RECORDING_PATH}.err"
+echo "RECORDING_STARTED"
+
+# Wait for STDIN to close
+cat
+
+kill -SIGINT "$simctlpid"
+wait $simctlpid

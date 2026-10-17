@@ -1,0 +1,864 @@
+package maestro.device
+
+import maestro.DeviceConnectionException
+import maestro.android.AndroidDeviceConnection
+import maestro.android.boundedAdbCall
+import maestro.android.newAdbIoExecutor
+import maestro.debuglog.DebugLogStore
+import maestro.device.util.AndroidEnvUtils
+import maestro.device.util.AvdDevice
+import maestro.device.util.PrintUtils
+import maestro.drivers.AndroidDriver
+import maestro.drivers.CdpWebDriver
+import maestro.utils.MaestroTimer
+import maestro.utils.TempFileHandler
+import okio.buffer
+import okio.source
+import org.slf4j.LoggerFactory
+import util.DeviceCtlResponse
+import util.LocalIOSDevice
+import util.LocalSimulatorUtils
+import util.SimctlList
+import java.io.File
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+
+data class AvdInfo(val name: String, val model: String, val os: String)
+
+object DeviceService {
+    private val logger = LoggerFactory.getLogger(DeviceService::class.java)
+
+    private val tempFileHandler = TempFileHandler()
+    private val localSimulatorUtils = LocalSimulatorUtils(tempFileHandler)
+
+    private const val DEVICE_DISCOVERY_TIMEOUT_MS = 5000L
+
+    fun startDevice(
+        device: Device.AvailableForLaunch,
+        driverHostPort: Int?,
+        connectedDevices: Set<String> = setOf()
+    ): Device.Connected {
+        when (device.deviceSpec.platform) {
+            Platform.IOS -> {
+                PrintUtils.message("Launching Simulator...")
+                try {
+                    val iosSpec = device.deviceSpec as DeviceSpec.Ios
+                    localSimulatorUtils.bootSimulator(device.modelId)
+                    PrintUtils.message("Setting the device locale to ${iosSpec.locale.code}...")
+                    localSimulatorUtils.setDeviceLanguage(device.modelId, iosSpec.locale.bcp47Tag)
+                    localSimulatorUtils.setDeviceLocale(device.modelId, iosSpec.locale.code)
+                    localSimulatorUtils.reboot(device.modelId)
+                    localSimulatorUtils.launchSimulator(device.modelId)
+                    localSimulatorUtils.awaitLaunch(device.modelId)
+                } catch (e: LocalSimulatorUtils.SimctlError) {
+                    logger.error("Failed to launch simulator", e)
+                    throw DeviceError(e.message)
+                }
+
+                return Device.Connected(
+                    instanceId = device.modelId,
+                    description = device.description,
+                    platform = device.platform,
+                    deviceType = device.deviceType,
+                    deviceSpec = device.deviceSpec,
+                )
+            }
+
+            Platform.ANDROID -> {
+                val androidSpec = device.deviceSpec as DeviceSpec.Android
+
+                // If the requested AVD is already running, reuse it: the emulator refuses to launch
+                // a duplicate of a running AVD (without -read-only), so we'd otherwise wait 60s for a
+                // device that never appears and then fail.
+                val runningSerial = listConnectedDevices()
+                    .firstOrNull { it.description == device.modelId }
+                    ?.instanceId
+
+                val connection = if (runningSerial != null) {
+                    PrintUtils.message("Device ${device.modelId} is already running, reusing it.")
+                    AndroidDeviceConnection.byId(
+                        deviceId = runningSerial,
+                        driverHostPort = driverHostPort ?: AndroidDeviceConnection.DEFAULT_DRIVER_HOST_PORT,
+                    ) ?: throw DeviceError("Unable to connect to already-running device: ${device.modelId}")
+                } else {
+                    PrintUtils.message("Launching Emulator...")
+                    val emulatorBinary = requireEmulatorBinary()
+
+                    // The emulator is long-running and chatty on stdout/stderr (GPU backend
+                    // probing, boot logs); left as the default PIPE with nobody reading it, it
+                    // blocks writing once the OS pipe buffer fills, stalling the emulator mid-boot
+                    // before adb ever sees it. Same failure mode runSdkManager's comment
+                    // describes, fixed the same way: redirect to a file instead of a pipe.
+                    // A plain temp file won't do: it's marked deleteOnExit, and this CLI process
+                    // exits (triggering that delete) while the emulator still has it open — on
+                    // POSIX that unlink succeeds, leaving nothing at the path once the command
+                    // returns. DebugLogStore's run directory isn't cleaned up until the run ends.
+                    val emulatorProcess = ProcessBuilder(
+                        emulatorBinary.absolutePath,
+                        "-avd",
+                        device.modelId,
+                        "-netdelay",
+                        "none",
+                        "-netspeed",
+                        "full"
+                    )
+                    DebugLogStore.logOutputOf(emulatorProcess)
+                    emulatorProcess.start().waitFor(10, TimeUnit.SECONDS)
+
+                    var lastException: Exception? = null
+
+                    // Dadb.list() (called via newestNotIn(), below) has no timeout and can block
+                    // forever against an offline/half-initialized device, which would otherwise
+                    // defeat this method's own 60s boot-wait budget. Same un-abortable-dadb-read
+                    // problem AdbSocketFactory already bounds for webview sockets; reuse its
+                    // worker-pool/timeout mechanism (boundedAdbCall) here too. Scoped per call,
+                    // not shared on DeviceService: a timed-out worker can't actually be
+                    // interrupted and stays parked forever, so a shared, long-lived pool would
+                    // let repeated failed starts in a long-running host (e.g. Maestro Studio)
+                    // saturate it and starve every later start.
+                    val deviceDiscoveryExecutor = newAdbIoExecutor()
+                    try {
+                        MaestroTimer.withTimeout(60000) {
+                            try {
+                                boundedAdbCall(deviceDiscoveryExecutor, DEVICE_DISCOVERY_TIMEOUT_MS, "Waiting for emulator to appear") {
+                                    AndroidDeviceConnection.newestNotIn(
+                                        connectedSerials = connectedDevices,
+                                        driverHostPort = driverHostPort ?: AndroidDeviceConnection.DEFAULT_DRIVER_HOST_PORT,
+                                    )
+                                }
+                            } catch (ignored: Exception) {
+                                Thread.sleep(100)
+                                lastException = ignored
+                                null
+                            }
+                        } ?: throw DeviceError("Unable to start device: ${device.modelId}. See the emulator log in ${DebugLogStore.logDirectory}", lastException)
+                    } finally {
+                        deviceDiscoveryExecutor.shutdown()
+                    }
+                }
+
+                // The boot/setup connection is only needed to install the driver app + set the locale;
+                // close it once setup is done so its adb socket doesn't leak (the device stays booted).
+                return connection.use { conn ->
+                    PrintUtils.message("Waiting for emulator ( ${device.modelId} ) to boot...")
+                    MaestroTimer.withTimeout(getDeviceBootTimeout()) {
+                        if (bootComplete(conn)) true else {
+                            Thread.sleep(1000)
+                            null
+                        }
+                    } ?: throw DeviceError("Emulator ${device.modelId} did not finish booting in time, consider increasing timeout by configuring $MAESTRO_DEVICE_BOOT_TIMEOUT env variable")
+
+                    PrintUtils.message("Setting the device locale to ${androidSpec.locale.code}...")
+                    val driver = AndroidDriver(conn)
+                    driver.installMaestroDriverApp()
+                    val result = driver.setDeviceLocale(
+                        country = androidSpec.locale.countryCode,
+                        language = androidSpec.locale.languageCode,
+                    )
+
+                    when (result) {
+                        SET_LOCALE_RESULT_SUCCESS -> PrintUtils.message("[Done] Setting the device locale to ${androidSpec.locale.code}...")
+                        SET_LOCALE_RESULT_LOCALE_NOT_VALID -> throw IllegalStateException("Failed to set locale ${androidSpec.locale.code}, the locale is not valid for a chosen device")
+                        SET_LOCALE_RESULT_UPDATE_CONFIGURATION_FAILED -> throw IllegalStateException("Failed to set locale ${androidSpec.locale.code}, exception during updating configuration occurred")
+                        else -> throw IllegalStateException("Failed to set locale ${androidSpec.locale.code}, unknown exception happened")
+                    }
+                    driver.uninstallMaestroDriverApp()
+
+                    Device.Connected(
+                        instanceId = conn.serial,
+                        description = device.description,
+                        platform = device.platform,
+                        deviceType = device.deviceType,
+                        deviceSpec = device.deviceSpec,
+                    )
+                }
+            }
+
+            Platform.WEB -> {
+                PrintUtils.message("Launching Web...")
+                CdpWebDriver(isStudio = false, isHeadless = false, screenSize = null).open()
+
+                return Device.Connected(
+                    instanceId = "chromium",
+                    description = "Chromium Web Browser",
+                    platform = device.platform,
+                    deviceType = device.deviceType,
+                    deviceSpec = device.deviceSpec,
+                )
+            }
+        }
+    }
+
+    fun listConnectedDevices(
+        includeWeb: Boolean = false,
+        host: String? = null,
+        port: Int? = null,
+    ): List<Device.Connected> {
+        return listDevices(includeWeb = includeWeb, host, port)
+            .filterIsInstance<Device.Connected>()
+    }
+
+    fun <T : Device> List<T>.withPlatform(platform: Platform?) =
+        filter { platform == null || it.platform == platform }
+
+    fun listAvailableForLaunchDevices(includeWeb: Boolean = false): List<Device.AvailableForLaunch> {
+        return listDevices(includeWeb = includeWeb)
+            .filterIsInstance<Device.AvailableForLaunch>()
+    }
+
+     fun listDevices(includeWeb: Boolean, host: String? = null, port: Int? = null): List<Device> {
+        return listAndroidDevices(host, port) +
+                listIOSDevices() +
+                if (includeWeb) {
+                    listWebDevices()
+                } else {
+                    listOf()
+                }
+    }
+
+    fun listWebDevices(): List<Device> {
+        return listOf(
+            Device.Connected(
+                platform = Platform.WEB,
+                description = "Chromium Web Browser",
+                instanceId = "chromium",
+                deviceType = Device.DeviceType.BROWSER,
+                deviceSpec = DeviceSpec.Web.DEFAULT
+            ),
+            Device.AvailableForLaunch(
+                modelId = "chromium",
+                description = "Chromium Web Browser",
+                platform = Platform.WEB,
+                deviceType = Device.DeviceType.BROWSER,
+                deviceSpec = DeviceSpec.Web.DEFAULT
+            )
+        )
+    }
+
+    fun listAndroidDevices(host: String? = null, port: Int? = null): List<Device> {
+        val host = host ?: "localhost"
+        if (port != null) {
+            return AndroidDeviceConnection.open(host, port).use { connection ->
+                listOf(
+                    Device.Connected(
+                        instanceId = connection.serial,
+                        description = connection.serial,
+                        platform = Platform.ANDROID,
+                        deviceType = Device.DeviceType.EMULATOR,
+                        deviceSpec = DeviceSpec.Android.DEFAULT
+                    )
+                )
+            }
+        }
+
+        // Fetch AVD info once (model + os) to avoid repeated avdmanager calls
+        val avdInfoList = fetchAndroidAvdInfo()
+
+        val connected = runCatching {
+            AndroidDeviceConnection.list(host = host).map { connection ->
+                connection.use {
+                    val avdName = runCatching {
+                        connection.shell("getprop ro.kernel.qemu").output.trim().let { qemuProp ->
+                            if (qemuProp == "1") {
+                                val avdNameResult = ProcessBuilder("adb", "-s", connection.serial, "emu", "avd", "name")
+                                    .redirectErrorStream(true)
+                                    .start()
+                                    .apply { waitFor(5, TimeUnit.SECONDS) }
+                                    .inputStream.bufferedReader().readLine()?.trim() ?: ""
+
+                                if (avdNameResult.isNotBlank() && !avdNameResult.contains("unknown AVD")) {
+                                    avdNameResult
+                                } else null
+                            } else null
+                        }
+                    }.getOrNull()
+
+                    val instanceId = connection.serial
+                    val deviceType = when {
+                        instanceId.startsWith("emulator") -> Device.DeviceType.EMULATOR
+                        else -> Device.DeviceType.REAL
+                    }
+                    Device.Connected(
+                        instanceId = instanceId,
+                        description = avdName ?: connection.serial,
+                        platform = Platform.ANDROID,
+                        deviceType = deviceType,
+                        deviceSpec = DeviceSpec.Android.DEFAULT,
+                    )
+                }
+            }
+        }.getOrNull() ?: emptyList()
+
+        // Note that there is a possibility that AVD is actually already connected and is present in
+        // connectedDevices.
+        val avds = try {
+            val emulatorBinary = requireEmulatorBinary()
+            ProcessBuilder(emulatorBinary.absolutePath, "-list-avds")
+                .start()
+                .inputStream
+                .bufferedReader()
+                .useLines { lines ->
+                    lines
+                        .map { avdName ->
+                            val avdInfo = avdInfoList.find { it.name == avdName } ?: AvdInfo(name = avdName, model = "", os = "")
+                            Device.AvailableForLaunch(
+                                modelId = avdName,
+                                description = avdName,
+                                platform = Platform.ANDROID,
+                                deviceType = Device.DeviceType.EMULATOR,
+                                deviceSpec = if (avdInfo.model.isBlank() || avdInfo.os.isBlank()) {
+                                    DeviceSpec.Android.DEFAULT
+                                } else {
+                                    DeviceSpec.Android(model = avdInfo.model, os = avdInfo.os)
+                                }
+                            )
+                        }
+                        .toList()
+                }
+        } catch (ignored: Exception) {
+            emptyList()
+        }
+
+        return connected + avds
+    }
+
+    /**
+     * Runs `avdmanager list avd` and returns a list of AvdInfo
+     * - name
+     * - model: the canonical device ID from avdmanager, e.g. "pixel_6"
+     * - os: "android-XX" derived from the API level, e.g. "android-34"
+     *
+     * Falls back to config.ini for the OS if avdmanager output lacks it.
+     * Returns empty string on any failure
+     */
+    private fun fetchAndroidAvdInfo(): List<AvdInfo> {
+        return try {
+            val avd = requireAvdManagerBinary()
+            val output = ProcessBuilder(avd.absolutePath, "list", "avd")
+                .redirectErrorStream(true)
+                .start()
+                .apply { waitFor(30, TimeUnit.SECONDS) }
+                .inputStream.bufferedReader().readText()
+            parseAvdInfo(output, AndroidEnvUtils.androidAvdHome)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    internal fun parseAvdInfo(output: String, avdHome: File): List<AvdInfo> {
+        val result = mutableListOf<AvdInfo>()
+        var currentName: String? = null
+        var currentModel: String? = null
+        var currentOs: String? = null
+
+        for (line in output.lines()) {
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith("Name:") -> {
+                    // Save previous block
+                    if (currentName != null) {
+                        result += AvdInfo(name = currentName, model = currentModel ?: "", os = currentOs ?: "")
+                    }
+                    currentName = trimmed.removePrefix("Name:").trim()
+                    currentModel = null
+                    currentOs = null
+                }
+                trimmed.startsWith("Device:") -> {
+                    // "pixel_6 (Google Pixel 6)" → "pixel_6"
+                    currentModel = trimmed.removePrefix("Device:").trim().substringBefore(" ")
+                }
+                currentOs == null && currentName != null -> {
+                    // Read OS from config.ini once we have the AVD name
+                    val configFile = File(avdHome, "$currentName.avd/config.ini")
+                    if (configFile.exists()) {
+                        val sysdir = configFile.readLines()
+                            .firstOrNull { it.startsWith("image.sysdir.1=") }
+                            ?.substringAfter("=")
+                        currentOs = sysdir?.split("/")?.firstOrNull { it.startsWith("android-") }
+                    }
+                }
+            }
+        }
+        // Save last block
+        if (currentName != null) {
+            result += AvdInfo(name = currentName, model = currentModel ?: "", os = currentOs ?: "")
+        }
+        return result
+    }
+
+    fun listIOSDevices(): List<Device> {
+        val simctlList = try {
+            localSimulatorUtils.list()
+        } catch (ignored: Exception) {
+            return emptyList()
+        }
+
+        val runtimeNameByIdentifier = simctlList
+            .runtimes
+            .associate { it.identifier to it.name }
+
+        return simctlList
+            .devices
+            .flatMap { runtime ->
+                runtime.value
+                    .filter { it.isAvailable }
+                    .map { device(runtimeNameByIdentifier, runtime, it) }
+            }
+            // Physical iOS devices aren't fully supported yet.
+            // + listIOSConnectedDevices()
+    }
+
+    fun listIOSConnectedDevices(): List<Device.Connected> {
+        val connectedIphoneList = try {
+            LocalIOSDevice().listDeviceViaDeviceCtl()
+        } catch (ignored: Exception) {
+            // devicectl is unavailable on older Xcode/macOS (needs Xcode 15 / macOS 13.5+),
+            // where it produces no output. Physical-device enumeration is optional, so degrade
+            // gracefully rather than aborting the whole device list (as simctl already does above).
+            return emptyList()
+        }
+
+        return connectedIphoneList.mapNotNull { device ->
+            val udid = device.hardwareProperties?.udid
+            if (device.connectionProperties.tunnelState != DeviceCtlResponse.ConnectionProperties.CONNECTED || udid == null) {
+                return@mapNotNull null
+            }
+
+            val description = listOfNotNull(
+                device.deviceProperties?.name,
+                device.deviceProperties?.osVersionNumber,
+                device.identifier
+            ).joinToString(" - ")
+
+            Device.Connected(
+                instanceId = udid,
+                description = description,
+                platform = Platform.IOS,
+                deviceType = Device.DeviceType.REAL,
+                deviceSpec = DeviceSpec.Ios.DEFAULT
+            )
+        }
+    }
+
+    private fun device(
+      runtimeNameByIdentifier: Map<String, String>,
+      runtime: Map.Entry<String, List<SimctlList.Device>>,
+      device: SimctlList.Device,
+    ): Device {
+        val runtimeName = runtimeNameByIdentifier[runtime.key] ?: "Unknown runtime"
+        val description = "${device.name} - $runtimeName - ${device.udid}"
+
+        // "com.apple.CoreSimulator.SimDeviceType.iPhone-XS" → "iPhone-XS"
+        val model = device.deviceTypeIdentifier?.substringAfterLast(".") ?: ""
+        // "com.apple.CoreSimulator.SimRuntime.iOS-17-5" → "iOS-17-5"
+        val os = runtime.key.substringAfterLast(".")
+
+        return if (device.state == "Booted") {
+            Device.Connected(
+                instanceId = device.udid,
+                description = description,
+                platform = Platform.IOS,
+                deviceType = Device.DeviceType.SIMULATOR,
+                deviceSpec = if (model.isBlank() || os.isBlank()) {
+                    DeviceSpec.Ios.DEFAULT
+                } else {
+                    DeviceSpec.Ios(model = model, os = os)
+                }
+            )
+        } else {
+            Device.AvailableForLaunch(
+                modelId = device.udid,
+                description = description,
+                platform = Platform.IOS,
+                deviceType =  Device.DeviceType.SIMULATOR,
+                deviceSpec = if (model.isBlank() || os.isBlank()) {
+                    DeviceSpec.Ios.DEFAULT
+                } else {
+                    DeviceSpec.Ios(model = model, os = os)
+                }
+            )
+        }
+    }
+
+    /**
+     * @return true if ios simulator or android emulator is currently connected
+     */
+    fun isDeviceConnected(deviceName: String, platform: Platform): Device.Connected? {
+        return when (platform) {
+            Platform.IOS -> listIOSDevices()
+                .filterIsInstance<Device.Connected>()
+                .find { it.description.contains(deviceName, ignoreCase = true) }
+
+            else -> runCatching {
+                (AndroidDeviceConnection.list() + AndroidDeviceConnection.listFromAdbServer(adbServerPort = 5038))
+                    .mapNotNull { connection ->
+                        connection.use {
+                            runCatching { connection.shell("getprop ro.kernel.qemu.avd_name").output }.getOrNull()
+                        }
+                    }
+                    .map { output ->
+                        Device.Connected(
+                            instanceId = output,
+                            description = output,
+                            platform = Platform.ANDROID,
+                            deviceType = Device.DeviceType.EMULATOR,
+                            deviceSpec = DeviceSpec.Android.DEFAULT
+                        )
+                    }
+                    .find { connectedDevice -> connectedDevice.description.contains(deviceName, ignoreCase = true) }
+            }.getOrNull()
+        }
+    }
+
+    /**
+     * @return true if ios simulator or android emulator is available to launch
+     */
+    fun isDeviceAvailableToLaunch(deviceName: String, platform: Platform): Device.AvailableForLaunch? {
+        return if (platform == Platform.IOS) {
+            listIOSDevices()
+                .filterIsInstance<Device.AvailableForLaunch>()
+                .find { it.description.contains(deviceName, ignoreCase = true) }
+        } else {
+            listAndroidDevices()
+                .filterIsInstance<Device.AvailableForLaunch>()
+                .find { it.description.contains(deviceName, ignoreCase = true) }
+        }
+    }
+
+    /**
+     * Creates an iOS simulator
+     *
+     * @param deviceName Any name
+     * @param device Simulator type as specified by Apple i.e. iPhone-11
+     * @param os OS runtime name as specified by Apple i.e. iOS-16-2
+     */
+    fun createIosDevice(deviceName: String, device: String, os: String): UUID {
+        val command = listOf(
+            "xcrun",
+            "simctl",
+            "create",
+            deviceName,
+            "com.apple.CoreSimulator.SimDeviceType.$device",
+            "com.apple.CoreSimulator.SimRuntime.$os"
+        )
+
+        val process = ProcessBuilder(*command.toTypedArray()).start()
+        if (!process.waitFor(5, TimeUnit.MINUTES)) {
+            throw TimeoutException()
+        }
+
+        if (process.exitValue() != 0) {
+            val processOutput = process.errorStream
+                .source()
+                .buffer()
+                .readUtf8()
+
+            throw IllegalStateException(processOutput)
+        } else {
+            val output = String(process.inputStream.readBytes()).trim()
+            return try {
+                UUID.fromString(output)
+            } catch (ignore: IllegalArgumentException) {
+                throw IllegalStateException("Unable to create device. No UUID was generated")
+            }
+        }
+    }
+
+    /**
+     * Creates an Android emulator
+     *
+     * @param deviceName Any device name
+     * @param device Device type as specified by the Android SDK i.e. "pixel_6"
+     * @param systemImage Full system package i.e "system-images;android-28;google_apis;x86_64"
+     */
+    fun createAndroidDevice(
+        deviceName: String,
+        device: String,
+        systemImage: String,
+        force: Boolean = false,
+    ): String {
+        val avd = requireAvdManagerBinary()
+        val name = deviceName
+        val command = mutableListOf(
+            avd.absolutePath,
+            "create", "avd",
+            "--name", name,
+            "--package", systemImage,
+            "--device", device,
+        )
+
+        if (force) command.add("--force")
+
+        val process = ProcessBuilder(*command.toTypedArray()).start()
+
+        if (!process.waitFor(5, TimeUnit.MINUTES)) {
+            throw TimeoutException()
+        }
+
+        if (process.exitValue() != 0) {
+            val processOutput = process.errorStream
+                .source()
+                .buffer()
+                .readUtf8()
+
+            throw IllegalStateException("Failed to start android emulator: $processOutput")
+        }
+
+        return name
+    }
+
+    fun getAvailablePixelDevices(): List<AvdDevice> {
+        val avd = requireAvdManagerBinary()
+        val command = mutableListOf(
+            avd.absolutePath,
+            "list", "device"
+        )
+
+        val process = ProcessBuilder(*command.toTypedArray()).start()
+
+        if (!process.waitFor(1, TimeUnit.MINUTES)) {
+            throw TimeoutException()
+        }
+
+        if (process.exitValue() != 0) {
+            val processOutput = process.inputStream.source().buffer().readUtf8() + "\n" + process.errorStream.source().buffer().readUtf8()
+
+            throw IllegalStateException("Failed to list avd devices emulator: $processOutput")
+        }
+
+        return runCatching {
+            AndroidEnvUtils.parsePixelDevices(String(process.inputStream.readBytes()).trim())
+        }.getOrNull() ?: emptyList()
+    }
+
+    /**
+     * @return true is Android system image is already installed
+     */
+    fun isAndroidSystemImageInstalled(image: String): Boolean {
+        return try {
+            val output = runSdkManager("--list_installed") ?: return false
+            image in parseSdkPackagePaths(output)
+        } catch (e: Exception) {
+            logger.error("Unable to detect if SDK package is installed", e)
+            false
+        }
+    }
+
+    /** Picks the sdkmanager package for [os]/[abi], installed images first. Null if nothing matches. */
+    fun resolveSystemImage(os: String, abi: CPU_ARCHITECTURE): String? {
+        selectSystemImage(listSystemImagePackages(installedOnly = true), os, abi)?.let { return it }
+        return selectSystemImage(listSystemImagePackages(installedOnly = false), os, abi)
+    }
+
+    // Newest stable minor of [os] (never a beta), google_apis-family tags only, google_apis first, never playstore.
+    internal fun selectSystemImage(candidates: List<String>, os: String, abi: CPU_ARCHITECTURE): String? {
+        fun platformOf(image: String) = image.split(";").getOrNull(1).orEmpty()
+        fun tagOf(image: String) = image.split(";").getOrNull(2).orEmpty()
+        // "android-37" -> 0, "android-37.1" -> 1, "android-37.2-beta1" -> null
+        fun minorOf(platform: String): Int? {
+            val suffix = platform.removePrefix(os)
+            return when {
+                suffix.isEmpty() -> 0
+                suffix.startsWith(".") -> suffix.drop(1).toIntOrNull()
+                else -> null
+            }
+        }
+        val matches = candidates.filter { image ->
+            val parts = image.split(";")
+            parts.size == 4 && parts[0] == "system-images" && parts[3] == abi.value &&
+                (platformOf(image) == os || platformOf(image).startsWith("$os.")) &&
+                minorOf(platformOf(image)) != null &&
+                tagOf(image).startsWith("google_apis") && !tagOf(image).contains("playstore")
+        }
+        val newestMinor = matches.maxOfOrNull { minorOf(platformOf(it))!! } ?: return null
+        val inNewest = matches.filter { minorOf(platformOf(it)) == newestMinor }
+        return inNewest.firstOrNull { tagOf(it) == "google_apis" } ?: inNewest.firstOrNull()
+    }
+
+    private fun listSystemImagePackages(installedOnly: Boolean): List<String> {
+        return try {
+            val output = runSdkManager(if (installedOnly) "--list_installed" else "--list") ?: return emptyList()
+            parseSdkPackagePaths(output)
+                .filter { it.startsWith("system-images;") && it.split(";").size == 4 }
+        } catch (e: Exception) {
+            logger.error("Unable to list Android system images", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Package paths from sdkmanager's listing, in the `;`-separated form sdkmanager takes as input.
+     * Rows are "  <path>  <version>  <desc>", with or without `|` separators. Command-line tools
+     * before 23.0 print paths with `;`; from 23.0 sdkmanager forwards to the Android CLI, which
+     * prints them with `/`.
+     */
+    internal fun parseSdkPackagePaths(output: String): List<String> {
+        return output.lineSequence()
+            .map { it.trim().substringBefore(" ").replace('/', ';') }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .toList()
+    }
+
+    /**
+     * Runs sdkmanager to completion and returns its stdout, or null if it exited non-zero. Throws
+     * [TimeoutException] if it does not finish in time.
+     *
+     * Stdout goes to a file rather than a pipe: a full listing is larger than the pipe buffer, and
+     * sdkmanager blocks writing to it while still holding the SDK lock, so any later sdkmanager
+     * call (an install, say) waits forever. On timeout the whole process tree is killed, because
+     * from 23.0 sdkmanager is a shell script and the lock is held by its child.
+     */
+    private fun runSdkManager(vararg args: String, timeoutMinutes: Long = 1): String? {
+        val output = tempFileHandler.createTempFile("sdkmanager", ".out")
+        try {
+            val process = ProcessBuilder(requireSdkManagerBinary().absolutePath, *args)
+                .redirectOutput(output)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            if (!process.waitFor(timeoutMinutes, TimeUnit.MINUTES)) {
+                destroyProcessTree(process)
+                throw TimeoutException("sdkmanager ${args.joinToString(" ")} did not finish in $timeoutMinutes minute(s)")
+            }
+            if (process.exitValue() != 0) return null
+            return output.readText()
+        } finally {
+            output.delete()
+        }
+    }
+
+    private fun destroyProcessTree(process: Process) {
+        process.descendants().forEach { it.destroyForcibly() }
+        process.destroyForcibly()
+    }
+
+    /**
+     * Uses the Android SDK manager to install android image
+     */
+    fun installAndroidSystemImage(image: String): Boolean {
+        val command = listOf(
+            requireSdkManagerBinary().absolutePath,
+            image
+        )
+        try {
+            val process = ProcessBuilder(*command.toTypedArray())
+                .inheritIO()
+                .start()
+            if (!process.waitFor(120, TimeUnit.MINUTES)) {
+                destroyProcessTree(process)
+                throw TimeoutException()
+            }
+
+            return process.exitValue() == 0 && isAndroidSystemImageInstalled(image)
+        } catch (e: Exception) {
+            logger.error("Unable to install if SDK package is installed", e)
+        }
+
+        return false
+    }
+
+    fun getAndroidSystemImageInstallCommand(pkg: String): String {
+        return listOf(
+            requireSdkManagerBinary().absolutePath,
+            "\"$pkg\""
+        ).joinToString(separator = " ")
+    }
+
+    fun deleteIosDevice(uuid: String): Boolean {
+        val command = listOf(
+            "xcrun",
+            "simctl",
+            "delete",
+            uuid
+        )
+
+        val process = ProcessBuilder(*command.toTypedArray()).start()
+
+        if (!process.waitFor(1, TimeUnit.MINUTES)) {
+            throw TimeoutException()
+        }
+
+        return process.exitValue() == 0
+    }
+
+    fun killAndroidDevice(deviceId: String): Boolean {
+        val command = listOf("adb", "-s", deviceId, "emu", "kill")
+
+        try {
+            val process = ProcessBuilder(*command.toTypedArray()).start()
+
+            if (!process.waitFor(1, TimeUnit.MINUTES)) {
+                throw TimeoutException("Android kill command timed out")
+            }
+
+            val success = process.exitValue() == 0
+            if (success) {
+                logger.info("Killed Android device: $deviceId")
+            } else {
+                logger.error("Failed to kill Android device: $deviceId")
+            }
+
+            return success
+        } catch (e: Exception) {
+            logger.error("Error killing Android device: $deviceId", e)
+            return false
+        }
+    }
+
+    fun killIOSDevice(deviceId: String): Boolean {
+        val command = listOf("xcrun", "simctl", "shutdown", deviceId)
+
+        try {
+            val process = ProcessBuilder(*command.toTypedArray()).start()
+
+            if (!process.waitFor(1, TimeUnit.MINUTES)) {
+                throw TimeoutException("iOS kill command timed out")
+            }
+
+            val success = process.exitValue() == 0
+            if (success) {
+                logger.info("Killed iOS device: $deviceId")
+            } else {
+                logger.error("Failed to kill iOS device: $deviceId")
+            }
+
+            return success
+        } catch (e: Exception) {
+            logger.error("Error killing iOS device: $deviceId", e)
+            return false
+        }
+    }
+
+    private fun bootComplete(connection: AndroidDeviceConnection): Boolean {
+        return try {
+            val booted = connection.shell("getprop sys.boot_completed").output.trim() == "1"
+            val settingsAvailable = connection.shell("settings list global").exitCode == 0
+            val packageManagerAvailable = connection.shell("pm get-max-users").exitCode == 0
+            return settingsAvailable && packageManagerAvailable && booted
+        } catch (e: IllegalStateException) {
+            false
+        } catch (e: DeviceConnectionException) {
+            // A transport death while the device is still coming up (shell throws a typed device
+            // connection failure, not a bare IOException) — treat as not-yet-booted and keep polling.
+            false
+        }
+    }
+
+    private fun requireEmulatorBinary(): File = AndroidEnvUtils.requireEmulatorBinary()
+
+    private fun requireAvdManagerBinary(): File = AndroidEnvUtils.requireCommandLineTools("avdmanager")
+
+    private fun requireSdkManagerBinary(): File = AndroidEnvUtils.requireCommandLineTools("sdkmanager")
+
+    private fun getDeviceBootTimeout(): Long = runCatching {
+        System.getenv(MAESTRO_DEVICE_BOOT_TIMEOUT).toLong()
+    }.getOrDefault(DEVICE_BOOT_TIMEOUT_MS)
+
+    private const val MAESTRO_DEVICE_BOOT_TIMEOUT = "MAESTRO_DEVICE_BOOT_TIMEOUT"
+    private const val DEVICE_BOOT_TIMEOUT_MS = 180_000L
+
+    private const val SET_LOCALE_RESULT_SUCCESS = 0
+    private const val SET_LOCALE_RESULT_LOCALE_NOT_VALID = 1
+    private const val SET_LOCALE_RESULT_UPDATE_CONFIGURATION_FAILED = 2
+}

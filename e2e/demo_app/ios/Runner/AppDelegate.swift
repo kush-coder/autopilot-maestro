@@ -1,0 +1,91 @@
+import Flutter
+import UIKit
+
+@main
+@objc class AppDelegate: FlutterAppDelegate {
+  override func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    GeneratedPluginRegistrant.register(with: self)
+
+    // Set up method channel for password test screen
+    let controller = window?.rootViewController as! FlutterViewController
+    let passwordTestChannel = FlutterMethodChannel(
+      name: "com.example.demo_app/password_test",
+      binaryMessenger: controller.binaryMessenger
+    )
+
+    passwordTestChannel.setMethodCallHandler { [weak self] (call, result) in
+      if call.method == "openPasswordTest" {
+        self?.openPasswordTestScreen()
+        result(nil)
+      } else {
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let orientationChannel = FlutterMethodChannel(
+      name: "com.example.demo_app/orientation",
+      binaryMessenger: controller.binaryMessenger
+    )
+
+    UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+
+    orientationChannel.setMethodCallHandler { (call, result) in
+      if call.method == "getOrientation" {
+        switch UIDevice.current.orientation {
+        case .portrait:             result("Portrait")
+        case .portraitUpsideDown:   result("Portrait Upside Down")
+        case .landscapeLeft:        result("Landscape Left")
+        case .landscapeRight:       result("Landscape Right")
+        default:                    result("Unknown")
+        }
+      } else {
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let healthAccessChannel = FlutterMethodChannel(
+      name: "com.example.demo_app/health_access",
+      binaryMessenger: controller.binaryMessenger
+    )
+
+    healthAccessChannel.setMethodCallHandler { (call, result) in
+      if call.method == "requestHealthAccess" {
+        HealthAccessManager.requestAuthorization { success, error in
+          if let error = error {
+            result(FlutterError(code: "HEALTH_ERROR", message: error.localizedDescription, details: nil))
+          } else {
+            result(success)
+          }
+        }
+      } else {
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    // Crash test screen: ends the process for real, which Dart code cannot do by throwing.
+    let crashChannel = FlutterMethodChannel(
+      name: "com.example.demo_app/crash",
+      binaryMessenger: controller.binaryMessenger
+    )
+
+    crashChannel.setMethodCallHandler { (call, result) in
+      switch call.method {
+      case "crash": fatalError("demo_app: crash requested from the crash test screen")
+      case "exit":  exit(0)
+      default:      result(FlutterMethodNotImplemented)
+      }
+    }
+
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  private func openPasswordTestScreen() {
+    guard let rootViewController = window?.rootViewController else { return }
+    let passwordTestVC = PasswordTestViewController()
+    passwordTestVC.modalPresentationStyle = .fullScreen
+    rootViewController.present(passwordTestVC, animated: true)
+  }
+}

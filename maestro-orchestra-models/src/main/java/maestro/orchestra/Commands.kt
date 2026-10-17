@@ -1,0 +1,1299 @@
+/*
+ *
+ *  Copyright (c) 2022 mobile.dev inc.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *
+ */
+
+package maestro.orchestra
+
+import maestro.device.DeviceOrientation
+import maestro.KeyCode
+import maestro.Point
+import maestro.ScrollDirection
+import maestro.SwipeDirection
+import maestro.TapRepeat
+import maestro.js.JsEngine
+import maestro.orchestra.util.Env.evaluateScripts
+import maestro.orchestra.util.Env.evaluateScriptsIncludingKeys
+import maestro.orchestra.util.NumericField
+import maestro.orchestra.util.NumericFieldKind
+import maestro.orchestra.util.NumericFields
+import com.fasterxml.jackson.annotation.JsonIgnore
+import maestro.MaestroException
+import java.nio.file.Path
+import net.datafaker.Faker
+
+internal fun parseTimeoutMs(timeout: String, commandDescription: String): Long {
+    return try {
+        timeout.replace("_", "").toLong()
+    } catch (e: NumberFormatException) {
+        throw MaestroException.InvalidCommand(
+            "Invalid timeout value '$timeout' in '$commandDescription'. Timeout must be a number of milliseconds."
+        )
+    }
+}
+
+sealed interface Command {
+
+    @get:JsonIgnore
+    val originalDescription: String
+
+    fun description(): String = label ?: originalDescription
+
+    fun evaluateScripts(jsEngine: JsEngine): Command
+
+    fun visible(): Boolean = true
+
+    val label: String?
+
+    val optional: Boolean
+}
+
+sealed interface CompositeCommand : Command {
+
+    fun subCommands(): List<MaestroCommand>
+    fun config(): MaestroConfig?
+}
+
+data class SwipeCommand(
+    val direction: SwipeDirection? = null,
+    val startPoint: Point? = null,
+    val endPoint: Point? = null,
+    val elementSelector: ElementSelector? = null,
+    @field:NumericField(NumericFieldKind.POINT)
+    val startRelative: String? = null,
+    @field:NumericField(NumericFieldKind.POINT)
+    val endRelative: String? = null,
+    val duration: Long = DEFAULT_DURATION_IN_MILLIS,
+    val waitToSettleTimeoutMs: Int? = null,
+    @field:NumericField(NumericFieldKind.POINT)
+    val relativePoint: String? = null, // element-relative start within swipe.from
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = when {
+            elementSelector != null && direction != null -> {
+                val pointInfo = relativePoint?.let { " at $it" } ?: ""
+                "Swiping in $direction direction on ${elementSelector.description()}$pointInfo"
+            }
+            direction != null -> {
+                "Swiping in $direction direction in $duration ms"
+            }
+            startPoint != null && endPoint != null -> {
+                "Swipe from (${startPoint.x},${startPoint.y}) to (${endPoint.x},${endPoint.y}) in $duration ms"
+            }
+            startRelative != null && endRelative != null -> {
+                "Swipe from ($startRelative) to ($endRelative) in $duration ms"
+            }
+            else -> "Invalid input to swipe command"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): SwipeCommand {
+        return copy(
+            elementSelector = elementSelector?.evaluateScripts(jsEngine),
+            startRelative = startRelative?.evaluateScripts(jsEngine),
+            endRelative = endRelative?.evaluateScripts(jsEngine),
+            relativePoint = relativePoint?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+    companion object {
+        private const val DEFAULT_DURATION_IN_MILLIS = 400L
+    }
+}
+
+/**
+ * @param visibilityPercentage 0-1 Visibility within viewport bounds. 0 not within viewport and 1 fully visible within viewport.
+ */
+data class ScrollUntilVisibleCommand(
+    val selector: ElementSelector,
+    val direction: ScrollDirection,
+    @field:NumericField(NumericFieldKind.SCROLL_SPEED)
+    val scrollDuration: String = DEFAULT_SCROLL_DURATION,
+    val visibilityPercentage: Int,
+    val timeout: String = DEFAULT_TIMEOUT_IN_MILLIS,
+    val waitToSettleTimeoutMs: Int? = null,
+    val centerElement: Boolean,
+    val originalSpeedValue: String? = scrollDuration,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    val visibilityPercentageNormalized = (visibilityPercentage / 100).toDouble()
+
+    override val originalDescription: String
+        get() {
+            val baseDescription = "Scrolling $direction until ${selector.description()} is visible"
+            val additionalDescription = mutableListOf<String>()
+            additionalDescription.add("with speed $originalSpeedValue")
+            additionalDescription.add("visibility percentage $visibilityPercentage%")
+            additionalDescription.add("timeout $timeout ms")
+            waitToSettleTimeoutMs?.let {
+                additionalDescription.add("wait to settle $it ms")
+            }
+            if (centerElement) {
+                additionalDescription.add("with centering enabled")
+            } else {
+                additionalDescription.add("with centering disabled")
+            }
+            return "$baseDescription ${additionalDescription.joinToString(", ")}"
+        }
+
+    private fun String.speedToDuration(): String {
+        // parseScrollSpeed guarantees 0..100, so duration is always in 1..1001 — never negative.
+        val duration = (1000 * (100 - NumericFields.parseScrollSpeed(this)).toDouble() / 100).toLong() + 1
+        return duration.toString()
+    }
+
+    private fun String.timeoutToMillis(): String {
+        val millis = parseTimeoutMs(this, this@ScrollUntilVisibleCommand.description())
+        return if (millis < 0) {
+            DEFAULT_TIMEOUT_IN_MILLIS
+        } else this
+    }
+
+    override fun evaluateScripts(jsEngine: JsEngine): ScrollUntilVisibleCommand {
+        return copy(
+            originalSpeedValue = scrollDuration,
+            selector = selector.evaluateScripts(jsEngine),
+            scrollDuration = scrollDuration.evaluateScripts(jsEngine).speedToDuration(),
+            timeout = timeout.evaluateScripts(jsEngine).timeoutToMillis(),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+    companion object {
+        const val DEFAULT_TIMEOUT_IN_MILLIS = "20000"
+        const val DEFAULT_SCROLL_DURATION = "40"
+        const val DEFAULT_ELEMENT_VISIBILITY_PERCENTAGE = 100
+        const val DEFAULT_CENTER_ELEMENT = false
+    }
+}
+
+data class ScrollCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Scroll vertically"
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        return javaClass.hashCode()
+    }
+
+    override fun toString(): String {
+        return "ScrollCommand()"
+    }
+
+    override fun evaluateScripts(jsEngine: JsEngine): ScrollCommand {
+        return copy(
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class BackPressCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Press back"
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        return javaClass.hashCode()
+    }
+
+    override fun toString(): String {
+        return "BackPressCommand()"
+    }
+
+    override fun evaluateScripts(jsEngine: JsEngine): BackPressCommand {
+        return copy(
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class HideKeyboardCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Hide Keyboard"
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        return javaClass.hashCode()
+    }
+
+    override fun toString(): String {
+        return "HideKeyboardCommand()"
+    }
+
+    override fun evaluateScripts(jsEngine: JsEngine): HideKeyboardCommand {
+        return copy(
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class CopyTextFromCommand(
+    val selector: ElementSelector,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Copy text from element with ${selector.description()}"
+
+    override fun evaluateScripts(jsEngine: JsEngine): CopyTextFromCommand {
+        return copy(
+            selector = selector.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class SetClipboardCommand(
+    val text: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Set Maestro clipboard to $text"
+
+    override fun evaluateScripts(jsEngine: JsEngine): SetClipboardCommand {
+        return copy(
+            text = text.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class PasteTextCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Paste text"
+
+    override fun evaluateScripts(jsEngine: JsEngine): PasteTextCommand {
+        return this
+    }
+}
+
+data class TapOnElementCommand(
+    val selector: ElementSelector,
+    val retryIfNoChange: Boolean? = null,
+    val waitUntilVisible: Boolean? = null,
+    val longPress: Boolean? = null,
+    val repeat: TapRepeat? = null,
+    val waitToSettleTimeoutMs: Int? = null,
+    @field:NumericField(NumericFieldKind.POINT)
+    val relativePoint: String? = null, // New parameter for element-relative coordinates
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() {
+            val optional = if (optional || selector.optional) "(Optional) " else ""
+            val pointInfo = relativePoint?.let { " at $it" } ?: ""
+            return "${tapOnDescription(longPress, repeat)} on $optional${selector.description()}$pointInfo"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): TapOnElementCommand {
+        return copy(
+            selector = selector.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+    companion object {
+        const val DEFAULT_REPEAT_DELAY = 100L
+        const val MAX_TIMEOUT_WAIT_TO_SETTLE_MS = 30000
+    }
+}
+
+@Deprecated("Use TapOnPointV2Command instead")
+data class TapOnPointCommand(
+    val x: Int,
+    val y: Int,
+    val retryIfNoChange: Boolean? = null,
+    val waitUntilVisible: Boolean? = null,
+    val longPress: Boolean? = null,
+    val repeat: TapRepeat? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "${tapOnDescription(longPress, repeat)} on point ($x, $y)"
+
+    override fun evaluateScripts(jsEngine: JsEngine): TapOnPointCommand {
+        return this
+    }
+}
+
+data class TapOnPointV2Command(
+    @field:NumericField(NumericFieldKind.POINT)
+    val point: String,
+    val retryIfNoChange: Boolean? = null,
+    val longPress: Boolean? = null,
+    val repeat: TapRepeat? = null,
+    val waitToSettleTimeoutMs: Int? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "${tapOnDescription(longPress, repeat)} on point ($point)"
+
+    override fun evaluateScripts(jsEngine: JsEngine): TapOnPointV2Command {
+        return copy(
+            point = point.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+@Deprecated("Use AssertConditionCommand instead")
+data class AssertCommand(
+    val visible: ElementSelector? = null,
+    val notVisible: ElementSelector? = null,
+    val timeout: Long? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() {
+            val timeoutStr = timeout?.let { " within $timeout ms" } ?: ""
+            return when {
+                visible != null -> "Assert visible ${visible.description()}" + timeoutStr
+                notVisible != null -> "Assert not visible ${notVisible.description()}" + timeoutStr
+                else -> "No op"
+            }
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): AssertCommand {
+        return copy(
+            visible = visible?.evaluateScripts(jsEngine),
+            notVisible = notVisible?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+    fun toAssertConditionCommand(): AssertConditionCommand {
+        return AssertConditionCommand(
+            condition = Condition(
+                visible = visible,
+                notVisible = notVisible,
+            ),
+            timeout = timeout?.toString(),
+        )
+    }
+}
+
+data class AssertConditionCommand(
+    val condition: Condition,
+    val timeout: String? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    fun timeoutMs(): Long? {
+        return timeout?.let { parseTimeoutMs(it, description()) }
+    }
+
+    override val originalDescription: String
+        get() {
+            val optional = if (optional || condition.visible?.optional == true || condition.notVisible?.optional == true) "(Optional) " else ""
+            return "Assert that $optional${condition.description()}"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            condition = condition.evaluateScripts(jsEngine),
+            timeout = timeout?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class AssertNoDefectsWithAICommand(
+    override val optional: Boolean = true,
+    override val label: String? = null,
+) : Command {
+    override val originalDescription: String
+        get() = "Assert no defects with AI"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command = this
+}
+
+data class AssertWithAICommand(
+    val assertion: String,
+    override val optional: Boolean = true,
+    override val label: String? = null,
+) : Command {
+    override val originalDescription: String
+        get() = "Assert with AI: $assertion"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            assertion = assertion.evaluateScripts(jsEngine),
+        )
+    }
+}
+
+data class ExtractTextWithAICommand(
+    val query: String,
+    val outputVariable: String,
+    override val optional: Boolean = true,
+    override val label: String? = null
+) : Command {
+    override val originalDescription: String
+        get() = "Extract text with AI: $query"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            query = query.evaluateScripts(jsEngine),
+        )
+    }
+}
+
+data class AssertScreenshotCommand(
+    val path: String,
+    val thresholdPercentage: String,
+    val cropOn: ElementSelector? = null,
+    override val optional: Boolean = false,
+    override val label: String? = null,
+    @field:JsonIgnore val flowPath: Path? = null,
+) : Command {
+    override val originalDescription: String
+        get() {
+            val cropInfo = cropOn?.let { " (cropped on ${it.description()})" } ?: ""
+            return "Assert screenshot matches $path (threshold: $thresholdPercentage%)$cropInfo"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            path = path.evaluateScripts(jsEngine),
+            thresholdPercentage = thresholdPercentage.evaluateScripts(jsEngine),
+            cropOn = cropOn?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class InputTextCommand(
+    val text: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Input text $text"
+
+    override fun evaluateScripts(jsEngine: JsEngine): InputTextCommand {
+        return copy(
+            text = text.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class LaunchAppCommand(
+    val appId: String,
+    val clearState: Boolean? = null,
+    val clearKeychain: Boolean? = null,
+    val stopApp: Boolean? = null,
+    var permissions: Map<String, String>? = null,
+    val launchArguments: Map<String, Any>? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() {
+            var result = if (clearState != true) {
+                "Launch app \"$appId\""
+            } else {
+                "Launch app \"$appId\" with clear state"
+            }
+
+            if (clearKeychain == true) {
+                result += " and clear keychain"
+            }
+
+            if (stopApp == false) {
+                result += " without stopping app"
+            }
+
+            if (launchArguments != null) {
+                result += " (launch arguments: ${launchArguments})"
+            }
+
+            return result
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): LaunchAppCommand {
+        return copy(
+            appId = appId.evaluateScripts(jsEngine),
+            permissions = permissions?.evaluateScripts(jsEngine, "permissions"),
+            launchArguments = launchArguments?.evaluateScriptsIncludingKeys(jsEngine, "launchArguments"),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class SetPermissionsCommand(
+    val appId: String,
+    var permissions: Map<String, String>,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Set permissions"
+
+    override fun evaluateScripts(jsEngine: JsEngine): SetPermissionsCommand {
+        return copy(
+            appId = appId.evaluateScripts(jsEngine),
+            permissions = permissions.evaluateScripts(jsEngine, "permissions"),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class ApplyConfigurationCommand(
+    val config: MaestroConfig,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Apply configuration"
+
+    override fun evaluateScripts(jsEngine: JsEngine): ApplyConfigurationCommand {
+        return copy(
+            config = config.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+    override fun visible(): Boolean = false
+}
+
+data class OpenLinkCommand(
+    val link: String,
+    val autoVerify: Boolean? = null,
+    val browser: Boolean? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = when {
+            browser == true -> if (autoVerify == true) "Open $link with auto verification in browser" else "Open $link in browser"
+            else -> if (autoVerify == true) "Open $link with auto verification" else "Open $link"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): OpenLinkCommand {
+        return copy(
+            link = link.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class PressKeyCommand(
+    val code: KeyCode,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Press ${code.description} key"
+
+    override fun evaluateScripts(jsEngine: JsEngine): PressKeyCommand {
+        return this
+    }
+}
+
+data class EraseTextCommand(
+    val charactersToErase: Int?,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = when (charactersToErase) {
+            null -> "Erase text"
+            else -> "Erase $charactersToErase characters"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): EraseTextCommand {
+        return this
+    }
+
+}
+
+data class TakeScreenshotCommand(
+    val path: String,
+    val cropOn: ElementSelector? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Take screenshot $path"
+
+    override fun description(): String {
+        return label ?: if (cropOn != null) {
+            "Take screenshot $path, cropped to ${cropOn.description()}"
+        } else {
+            "Take screenshot $path"
+        }
+    }
+
+    override fun evaluateScripts(jsEngine: JsEngine): TakeScreenshotCommand {
+        return copy(
+            path = path.evaluateScripts(jsEngine),
+            cropOn = cropOn?.evaluateScripts(jsEngine),
+        )
+    }
+}
+
+data class StopAppCommand(
+    val appId: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Stop $appId"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            appId = appId.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class KillAppCommand(
+    val appId: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Kill $appId"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            appId = appId.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class ClearStateCommand(
+    val appId: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Clear state of $appId"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            appId = appId.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+class ClearKeychainCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Clear keychain"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        return javaClass.hashCode()
+    }
+}
+
+enum class InputRandomType {
+    NUMBER,
+    TEXT,
+    TEXT_EMAIL_ADDRESS,
+    TEXT_PERSON_NAME,
+    TEXT_CITY_NAME,
+    TEXT_COUNTRY_NAME,
+    TEXT_COLOR,
+}
+
+data class InputRandomCommand(
+    val inputType: InputRandomType? = InputRandomType.TEXT,
+    val length: Int? = 8,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    fun genRandomString(): String {
+        val faker = Faker()
+        val lengthNonNull = length ?: 8
+        val finalLength = if (lengthNonNull <= 0) 8 else lengthNonNull
+
+        return when (inputType) {
+            InputRandomType.NUMBER -> faker.number().randomNumber(finalLength).toString()
+            InputRandomType.TEXT -> faker.text().text(finalLength)
+            InputRandomType.TEXT_EMAIL_ADDRESS -> faker.internet().emailAddress()
+            InputRandomType.TEXT_PERSON_NAME -> faker.name().firstName() + ' ' + faker.name().lastName()
+            InputRandomType.TEXT_CITY_NAME -> faker.address().cityName()
+            InputRandomType.TEXT_COUNTRY_NAME -> faker.address().country()
+            InputRandomType.TEXT_COLOR -> faker.color().name()
+            else -> faker.text().text(finalLength)
+        }
+    }
+
+    override val originalDescription: String
+        get() = "Input text random $inputType"
+
+    override fun evaluateScripts(jsEngine: JsEngine): InputRandomCommand {
+        return this
+    }
+}
+
+data class RunFlowCommand(
+    val commands: List<MaestroCommand>,
+    val condition: Condition? = null,
+    val sourceDescription: String? = null,
+    val config: MaestroConfig?,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : CompositeCommand {
+
+    override fun subCommands(): List<MaestroCommand> {
+        return commands
+    }
+
+    override fun config(): MaestroConfig? {
+        return config
+    }
+
+    override val originalDescription: String
+        get() {
+            val runDescription = if (sourceDescription != null) {
+                "Run $sourceDescription"
+            } else {
+                "Run flow"
+            }
+
+            return if (condition == null) {
+                runDescription
+            } else {
+                "$runDescription when ${condition.description()}"
+            }
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            condition = condition?.evaluateScripts(jsEngine),
+            config = config?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class SetLocationCommand(
+    val latitude: String,
+    val longitude: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Set location (${latitude}, ${longitude})"
+
+    override fun evaluateScripts(jsEngine: JsEngine): SetLocationCommand {
+        return copy(
+            latitude = latitude.evaluateScripts(jsEngine),
+            longitude = longitude.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class SetOrientationCommand(
+    val orientation: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    constructor(
+        orientation: DeviceOrientation,
+        label: String? = null,
+        optional: Boolean = false,
+    ) : this(
+        orientation = orientation.name,
+        label = label,
+        optional = optional
+    )
+
+    override val originalDescription: String
+        get() = "Set orientation ${orientation}"
+
+    override fun description(): String {
+        return label ?: "Set orientation ${orientation}"
+    }
+
+    fun resolvedOrientation(): DeviceOrientation {
+        return DeviceOrientation.getByName(orientation)
+            ?: error("Unknown orientation: $orientation")
+    }
+
+    override fun evaluateScripts(jsEngine: JsEngine): SetOrientationCommand {
+        val evaluatedOrientation = orientation.evaluateScripts(jsEngine)
+        val validOrientations = DeviceOrientation.entries
+        val resolved = DeviceOrientation.getByName(evaluatedOrientation)
+            ?: error(
+                "Unknown orientation: $evaluatedOrientation. Valid orientations are: $validOrientations \n" +
+                    "(case insensitive, underscores optional, e.g 'landscape_left', 'landscapeLeft', and 'LANDSCAPE_LEFT' are all valid)"
+            )
+        return copy(
+            orientation = resolved.name,
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class RepeatCommand(
+    val times: String? = null,
+    val condition: Condition? = null,
+    val commands: List<MaestroCommand>,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : CompositeCommand {
+
+    override fun subCommands(): List<MaestroCommand> {
+        return commands
+    }
+
+    override fun config(): MaestroConfig? {
+        return null
+    }
+
+    override val originalDescription: String
+        get() {
+            val timesInt = times?.toIntOrNull() ?: 1
+
+            return when {
+                condition != null && timesInt > 1 -> {
+                    "Repeat while ${condition.description()} (up to $timesInt times)"
+                }
+                condition != null -> {
+                    "Repeat while ${condition.description()}"
+                }
+                timesInt > 1 -> "Repeat $timesInt times"
+                else -> "Repeat indefinitely"
+            }
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            times = times?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+}
+
+data class RetryCommand(
+    val maxRetries: String? = null,
+    val commands: List<MaestroCommand>,
+    val config: MaestroConfig?,
+    val sourceDescription: String? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : CompositeCommand {
+
+    override fun subCommands(): List<MaestroCommand> {
+        return commands
+    }
+
+    override fun config(): MaestroConfig? {
+        return null
+    }
+
+    override val originalDescription: String
+        get() {
+            val maxAttempts = maxRetries?.toIntOrNull() ?: 1
+            val baseDescription = if (sourceDescription != null) {
+                "Retry $sourceDescription"
+            } else {
+                "Retry"
+            }
+            return "$baseDescription $maxAttempts times"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            maxRetries = maxRetries?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+}
+
+data class DefineVariablesCommand(
+    val env: Map<String, String>,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Define variables"
+
+    override fun evaluateScripts(jsEngine: JsEngine): DefineVariablesCommand {
+        return copy(
+            env = env.evaluateScripts(jsEngine, "env"),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+    override fun visible(): Boolean = false
+}
+
+data class RunScriptCommand(
+    val script: String,
+    val env: Map<String, String> = emptyMap(),
+    val sourceDescription: String,
+    val condition: Condition?,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+    val scriptDir: String? = null, // Parent dir of the script file; JS uses it for relative paths (e.g. multipartForm). Null if not from YAML.
+) : Command {
+
+    override val originalDescription: String
+        get() = if (condition == null) {
+            "Run $sourceDescription"
+        } else {
+            "Run $sourceDescription when ${condition.description()}"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            env = env.evaluateScripts(jsEngine, "env"),
+            condition = condition?.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class WaitForAnimationToEndCommand(
+    val timeout: String?,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() {
+            var description = "Wait for animation to end"
+            timeout?.let {
+                description += " within $it ms"
+            }
+            return description
+        }
+
+    private fun String.timeoutToMillis(): String? {
+        return if (this.toLong() < 0) {
+            null
+        } else this
+    }
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            timeout = timeout?.evaluateScripts(jsEngine)?.timeoutToMillis()
+        )
+    }
+}
+
+data class EvalScriptCommand(
+    val scriptString: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Run $scriptString"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+
+}
+
+data class TravelCommand(
+    val points: List<GeoPoint>,
+    val speedMPS: Double? = null,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    data class GeoPoint(
+        val latitude: String,
+        val longitude: String,
+    ) {
+
+        fun getDistanceInMeters(another: GeoPoint): Double {
+            val earthRadius = 6371 // in kilometers
+            val oLat = Math.toRadians(latitude.toDouble())
+            val oLon = Math.toRadians(longitude.toDouble())
+
+            val aLat = Math.toRadians(another.latitude.toDouble())
+            val aLon = Math.toRadians(another.longitude.toDouble())
+
+            val dLat = Math.toRadians(aLat - oLat)
+            val dLon = Math.toRadians(aLon - oLon)
+
+            val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                    Math.cos(Math.toRadians(oLat)) * Math.cos(Math.toRadians(aLat)) *
+                    Math.sin(dLon / 2) * Math.sin(dLon / 2)
+
+            val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+            val distance = earthRadius * c * 1000 // convert to meters
+
+            return distance
+        }
+
+    }
+
+    override val originalDescription: String
+        get() = "Travel path ${points.joinToString { "(${it.latitude}, ${it.longitude})" }}"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            points = points.map {
+                it.copy(
+                    latitude = it.latitude.evaluateScripts(jsEngine),
+                    longitude = it.longitude.evaluateScripts(jsEngine)
+                )
+            },
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+
+}
+
+data class StartRecordingCommand(
+    val path: String,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Start recording $path"
+
+    override fun evaluateScripts(jsEngine: JsEngine): StartRecordingCommand {
+        return copy(
+            path = path.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+data class AddMediaCommand(
+    val mediaPaths: List<String>,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Adding media files(${mediaPaths.size}) to the device"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return copy(
+            mediaPaths = mediaPaths.evaluateScripts(jsEngine),
+            label = label?.evaluateScripts(jsEngine)
+        )
+    }
+}
+
+
+data class StopRecordingCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+
+    override val originalDescription: String
+        get() = "Stop recording"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+/**
+ * [yamlValue] is the word written in YAML. It is deliberately NOT a `@JsonProperty` on each constant:
+ * Jackson serializes this enum as `SetAirplaneModeCommand.value` on the MaestroCommand wire, where the
+ * constant name is what is written and read back, so renaming it there would break every command already
+ * persisted or in flight. The schema reads the word through `@YamlValues(spelledBy = "yamlValue")`.
+ */
+enum class AirplaneValue(val yamlValue: String) {
+    Enable("enabled"),
+    Disable("disabled"),
+}
+
+data class SetAirplaneModeCommand(
+    val value: AirplaneValue,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+    override val originalDescription: String
+        get() = when (value) {
+            AirplaneValue.Enable -> "Enable airplane mode"
+            AirplaneValue.Disable -> "Disable airplane mode"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+data class ToggleAirplaneModeCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+    override val originalDescription: String
+        get() = "Toggle airplane mode"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+/**
+ * [yamlValue] is the word written in YAML. It is deliberately NOT a `@JsonProperty` on each constant:
+ * Jackson serializes this enum as `SetDarkModeCommand.value` on the MaestroCommand wire, where the
+ * constant name is what is written and read back, so renaming it there would break every command already
+ * persisted or in flight. The schema reads the word through `@YamlValues(spelledBy = "yamlValue")`.
+ */
+enum class DarkModeValue(val yamlValue: String) {
+    Enable("enabled"),
+    Disable("disabled"),
+}
+
+data class SetDarkModeCommand(
+    val value: DarkModeValue,
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+    override val originalDescription: String
+        get() = when (value) {
+            DarkModeValue.Enable -> "Enable dark mode"
+            DarkModeValue.Disable -> "Disable dark mode"
+        }
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+data class ToggleDarkModeCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+    override val originalDescription: String
+        get() = "Toggle dark mode"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+data class AssertDarkModeCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+    override val originalDescription: String
+        get() = "Assert dark mode is enabled"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+data class AssertLightModeCommand(
+    override val label: String? = null,
+    override val optional: Boolean = false,
+) : Command {
+    override val originalDescription: String
+        get() = "Assert dark mode is disabled"
+
+    override fun evaluateScripts(jsEngine: JsEngine): Command {
+        return this
+    }
+}
+
+internal fun tapOnDescription(isLongPress: Boolean?, repeat: TapRepeat?): String {
+    return if (isLongPress == true) "Long press"
+    else if (repeat != null) {
+        when (repeat.repeat) {
+            1 -> "Tap"
+            2 -> "Double tap"
+            else -> "Tap x${repeat.repeat}"
+        }
+    } else "Tap"
+}

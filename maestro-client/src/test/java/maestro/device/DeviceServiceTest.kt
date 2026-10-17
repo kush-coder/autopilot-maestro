@@ -1,0 +1,349 @@
+package maestro.device
+
+import com.google.common.truth.Truth.assertThat
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+
+internal class DeviceServiceTest {
+
+    @TempDir
+    lateinit var avdHome: File
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /** Creates <avdHome>/<avdName>.avd/config.ini with the given content. */
+    private fun writeConfigIni(avdName: String, content: String) {
+        val dir = File(avdHome, "$avdName.avd").also { it.mkdirs() }
+        File(dir, "config.ini").writeText(content)
+    }
+
+    private fun List<AvdInfo>.named(name: String) = find { it.name == name }
+
+    // -------------------------------------------------------------------------
+    // Happy-path
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `single AVD with all fields and config ini present`() {
+        writeConfigIni(
+            "Pixel_6_API_34",
+            "image.sysdir.1=system-images/android-34/google_apis/arm64-v8a/\n"
+        )
+
+        val output = """
+            Available Android Virtual Devices:
+                Name: Pixel_6_API_34
+              Device: pixel_6 (Google Pixel 6)
+                Path: /home/user/.android/avd/Pixel_6_API_34.avd
+              Target: Google APIs (Google Inc.)
+                      Based on: Android 14.0 ("UpsideDownCake") Tag/ABI: google_apis/arm64-v8a
+                Skin: pixel_6
+              Sdcard: 512M
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result).hasSize(1)
+        assertThat(result.named("Pixel_6_API_34")).isEqualTo(AvdInfo(name = "Pixel_6_API_34", model = "pixel_6", os = "android-34"))
+    }
+
+    @Test
+    fun `multiple AVDs are all parsed`() {
+        writeConfigIni("Pixel_6_API_34", "image.sysdir.1=system-images/android-34/google_apis/arm64-v8a/\n")
+        writeConfigIni("Pixel_7_API_33", "image.sysdir.1=system-images/android-33/google_apis/x86_64/\n")
+
+        val output = """
+            Available Android Virtual Devices:
+                Name: Pixel_6_API_34
+              Device: pixel_6 (Google Pixel 6)
+                Path: /home/user/.android/avd/Pixel_6_API_34.avd
+              Target: Google APIs (Google Inc.)
+                      Based on: Android 14.0 Tag/ABI: google_apis/arm64-v8a
+            ---------
+                Name: Pixel_7_API_33
+              Device: pixel_7 (Google Pixel 7)
+                Path: /home/user/.android/avd/Pixel_7_API_33.avd
+              Target: Google APIs (Google Inc.)
+                      Based on: Android 13.0 Tag/ABI: google_apis/x86_64
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result).hasSize(2)
+        assertThat(result.named("Pixel_6_API_34")).isEqualTo(AvdInfo(name = "Pixel_6_API_34", model = "pixel_6", os = "android-34"))
+        assertThat(result.named("Pixel_7_API_33")).isEqualTo(AvdInfo(name = "Pixel_7_API_33", model = "pixel_7", os = "android-33"))
+    }
+
+    // -------------------------------------------------------------------------
+    // Model (Device:) field edge cases
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `Device field with no parenthetical description uses full token as model`() {
+        writeConfigIni("Pixel_6_API_34", "image.sysdir.1=system-images/android-34/google_apis/arm64-v8a/\n")
+
+        val output = """
+            Available Android Virtual Devices:
+                Name: Pixel_6_API_34
+              Device: pixel_6
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result.named("Pixel_6_API_34")).isEqualTo(AvdInfo(name = "Pixel_6_API_34", model = "pixel_6", os = ""))
+    }
+
+    @Test
+    fun `missing Device field results in empty model string`() {
+        writeConfigIni("Pixel_6_API_34", "image.sysdir.1=system-images/android-34/google_apis/arm64-v8a/\n")
+
+        val output = """
+            Available Android Virtual Devices:
+                Name: Pixel_6_API_34
+                Path: /home/user/.android/avd/Pixel_6_API_34.avd
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result.named("Pixel_6_API_34")).isEqualTo(AvdInfo(name = "Pixel_6_API_34", model = "", os = "android-34"))
+    }
+
+    // -------------------------------------------------------------------------
+    // OS / config.ini edge cases
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `config ini missing results in empty OS string`() {
+        // No config.ini written for this AVD
+
+        val output = """
+            Available Android Virtual Devices:
+                Name: No_Config_AVD
+              Device: pixel_6 (Google Pixel 6)
+                Path: /home/user/.android/avd/No_Config_AVD.avd
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result.named("No_Config_AVD")).isEqualTo(AvdInfo(name = "No_Config_AVD", model = "pixel_6", os = ""))
+    }
+
+    @Test
+    fun `config ini present but lacks image sysdir line results in empty OS string`() {
+        writeConfigIni("AVD_No_Sysdir", "hw.ramSize=2048\ntarget=android-34\n")
+
+        // Path: line triggers the config.ini fallback branch
+        val output = """
+            Available Android Virtual Devices:
+                Name: AVD_No_Sysdir
+              Device: pixel_6 (Google Pixel 6)
+                Path: /home/user/.android/avd/AVD_No_Sysdir.avd
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result.named("AVD_No_Sysdir")).isEqualTo(AvdInfo(name = "AVD_No_Sysdir", model = "pixel_6", os = ""))
+    }
+
+    @Test
+    fun `config ini sysdir with no android-XX segment results in empty OS string`() {
+        writeConfigIni("AVD_Weird_Sysdir", "image.sysdir.1=custom-images/vendor-image/arm64-v8a/\n")
+
+        // Path: line triggers the config.ini fallback branch
+        val output = """
+            Available Android Virtual Devices:
+                Name: AVD_Weird_Sysdir
+              Device: pixel_6 (Google Pixel 6)
+                Path: /home/user/.android/avd/AVD_Weird_Sysdir.avd
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result.named("AVD_Weird_Sysdir")).isEqualTo(AvdInfo(name = "AVD_Weird_Sysdir", model = "pixel_6", os = ""))
+    }
+
+    @Test
+    fun `config ini sysdir with android-XX at a non-first segment is still found`() {
+        writeConfigIni(
+            "Nested_AVD",
+            "image.sysdir.1=sdk/system-images/android-30/google_apis_playstore/x86/\n"
+        )
+
+        // A non-Name/non-Device line (e.g. Path:) is required to trigger the
+        // config.ini fallback branch — it only fires on "other" lines.
+        val output = """
+            Available Android Virtual Devices:
+                Name: Nested_AVD
+              Device: pixel_4 (Google Pixel 4)
+                Path: /home/user/.android/avd/Nested_AVD.avd
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result.named("Nested_AVD")).isEqualTo(AvdInfo(name = "Nested_AVD", model = "pixel_4", os = "android-30"))
+    }
+
+    // -------------------------------------------------------------------------
+    // Empty / degenerate input
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `empty output returns empty list`() {
+        val result = DeviceService.parseAvdInfo("", avdHome)
+        assertThat(result).isEmpty()
+    }
+
+    @Test
+    fun `output with no AVDs returns empty list`() {
+        val output = "Available Android Virtual Devices:\n"
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+        assertThat(result).isEmpty()
+    }
+
+    @Test
+    fun `Name line with no subsequent Device or config ini still saved with empty values`() {
+        // AVD block containing only a Name: line — no Device:, no config.ini
+        val output = """
+            Available Android Virtual Devices:
+                Name: Bare_AVD
+        """.trimIndent()
+
+        val result = DeviceService.parseAvdInfo(output, avdHome)
+
+        assertThat(result).hasSize(1)
+        assertThat(result.named("Bare_AVD")).isEqualTo(AvdInfo(name = "Bare_AVD", model = "", os = ""))
+    }
+
+    // -------------------------------------------------------------------------
+    // selectSystemImage — image resolution by preference
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `selectSystemImage prefers google_apis when multiple variants match`() {
+        val candidates = listOf(
+            "system-images;android-34;google_apis_playstore;arm64-v8a",
+            "system-images;android-34;google_apis;arm64-v8a",
+            "system-images;android-34;google_apis_ps16k;arm64-v8a",
+        )
+        assertThat(DeviceService.selectSystemImage(candidates, "android-34", CPU_ARCHITECTURE.ARM64))
+            .isEqualTo("system-images;android-34;google_apis;arm64-v8a")
+    }
+
+    @Test
+    fun `selectSystemImage falls back to the available rootable variant when google_apis is absent`() {
+        val candidates = listOf(
+            "system-images;android-37.1;google_apis_ps16k;arm64-v8a",
+            "system-images;android-37.1;google_apis_playstore_ps16k;arm64-v8a",
+        )
+        assertThat(DeviceService.selectSystemImage(candidates, "android-37.1", CPU_ARCHITECTURE.ARM64))
+            .isEqualTo("system-images;android-37.1;google_apis_ps16k;arm64-v8a")
+    }
+
+    @Test
+    fun `selectSystemImage matches a minor-versioned platform from a major os`() {
+        val candidates = listOf("system-images;android-37.1;google_apis_ps16k;x86_64")
+        assertThat(DeviceService.selectSystemImage(candidates, "android-37", CPU_ARCHITECTURE.X86_64))
+            .isEqualTo("system-images;android-37.1;google_apis_ps16k;x86_64")
+    }
+
+    @Test
+    fun `selectSystemImage filters by abi`() {
+        val candidates = listOf(
+            "system-images;android-34;google_apis;x86_64",
+            "system-images;android-34;google_apis;arm64-v8a",
+        )
+        assertThat(DeviceService.selectSystemImage(candidates, "android-34", CPU_ARCHITECTURE.ARM64))
+            .isEqualTo("system-images;android-34;google_apis;arm64-v8a")
+    }
+
+    @Test
+    fun `selectSystemImage never selects a playstore-only image`() {
+        val candidates = listOf("system-images;android-34;google_apis_playstore;arm64-v8a")
+        assertThat(DeviceService.selectSystemImage(candidates, "android-34", CPU_ARCHITECTURE.ARM64)).isNull()
+    }
+
+    @Test
+    fun `selectSystemImage picks the newest stable minor for a major os`() {
+        // Real API 37 shape: 37.0 has google_apis, 37.1 (newest stable) only ps16k, 37.2 is beta.
+        val candidates = listOf(
+            "system-images;android-37.0;google_apis;arm64-v8a",
+            "system-images;android-37.0;google_apis_ps16k;arm64-v8a",
+            "system-images;android-37.1;google_apis_ps16k;arm64-v8a",
+            "system-images;android-37.1;google_apis_playstore_ps16k;arm64-v8a",
+            "system-images;android-37.2-beta1;google_apis_ps16k;arm64-v8a",
+        )
+        assertThat(DeviceService.selectSystemImage(candidates, "android-37", CPU_ARCHITECTURE.ARM64))
+            .isEqualTo("system-images;android-37.1;google_apis_ps16k;arm64-v8a")
+    }
+
+    @Test
+    fun `selectSystemImage never selects a pre-release minor`() {
+        val candidates = listOf("system-images;android-37.2-beta1;google_apis_ps16k;arm64-v8a")
+        assertThat(DeviceService.selectSystemImage(candidates, "android-37", CPU_ARCHITECTURE.ARM64)).isNull()
+    }
+
+    @Test
+    fun `selectSystemImage ignores tags outside the google_apis family`() {
+        val candidates = listOf(
+            "system-images;android-37.0;android-wear-signed;arm64-v8a",
+            "system-images;android-37.0;default;arm64-v8a",
+        )
+        assertThat(DeviceService.selectSystemImage(candidates, "android-37", CPU_ARCHITECTURE.ARM64)).isNull()
+    }
+
+    @Test
+    fun `selectSystemImage returns null when nothing matches the os`() {
+        val candidates = listOf("system-images;android-35;google_apis;arm64-v8a")
+        assertThat(DeviceService.selectSystemImage(candidates, "android-34", CPU_ARCHITECTURE.ARM64)).isNull()
+    }
+
+    // -------------------------------------------------------------------------
+    // parseSdkPackagePaths — sdkmanager listing, before and after cmdline-tools 23.0
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `parseSdkPackagePaths reads the pre-23 sdkmanager listing`() {
+        val output = """
+            Installed packages:
+              Path                                           | Version | Description                         | Location
+              -------                                        | ------- | -------                             | -------
+              build-tools;34.0.0                             | 34.0.0  | Android SDK Build-Tools 34          | build-tools/34.0.0
+              system-images;android-33;google_apis;arm64-v8a | 17      | Google APIs ARM 64 v8a System Image | system-images/android-33/google_apis/arm64-v8a
+        """.trimIndent()
+
+        val paths = DeviceService.parseSdkPackagePaths(output)
+
+        assertThat(paths).contains("system-images;android-33;google_apis;arm64-v8a")
+        assertThat(paths).contains("build-tools;34.0.0")
+        assertThat(paths).doesNotContain("system-images;android-33;google_apis;arm64-v8a;17")
+    }
+
+    @Test
+    fun `parseSdkPackagePaths reads the Android CLI listing from cmdline-tools 23`() {
+        val output = """
+            Installed packages:
+              build-tools/34.0.0                                               34.0.0                             Android SDK Build-Tools 34
+              system-images/android-33/google_apis/arm64-v8a                   17.0.0                             Google APIs ARM 64 v8a System Image
+              system-images/android-37.0/google_apis_ps16k/arm64-v8a           7.0.0                              16 KB Page Size Google APIs ARM 64 v8a System Image
+        """.trimIndent()
+
+        val paths = DeviceService.parseSdkPackagePaths(output)
+
+        assertThat(paths).containsAtLeast(
+            "build-tools;34.0.0",
+            "system-images;android-33;google_apis;arm64-v8a",
+            "system-images;android-37.0;google_apis_ps16k;arm64-v8a",
+        )
+    }
+
+    @Test
+    fun `parseSdkPackagePaths matches an installed image exactly, not by prefix`() {
+        val output = "  system-images/android-33-ext5/google_apis_playstore/arm64-v8a   2.0.0   Google Play ARM 64 v8a System Image"
+
+        assertThat(DeviceService.parseSdkPackagePaths(output))
+            .doesNotContain("system-images;android-33;google_apis_playstore;arm64-v8a")
+    }
+}
